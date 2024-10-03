@@ -1,4 +1,4 @@
-# MongoDB replicaset running on vSphere using Terraform & Ansible
+# PostgreSQL 16 running on vSphere using Terraform & Ansible
 
 This repository is to build out a demo environment for evaluation and development purposes. 
 
