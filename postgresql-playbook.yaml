@@ -1,0 +1,143 @@
+---
+- hosts: postgresql_nodes
+  become: yes
+  tasks:
+    - name: Ensure DNS is configured
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 8.8.8.8
+          nameserver 8.8.4.4
+
+    - name: Check if default route exists
+      command: ip route show default
+      register: default_route
+      ignore_errors: yes
+
+    - name: Add IP route if not exists
+      command: ip route add default via 192.168.169.1
+      when: default_route.rc != 0
+
+    - name: Check network connectivity
+      command: ping -c 4 google.com
+      register: ping_result
+      ignore_errors: yes
+
+    - name: Fail if no network connectivity
+      fail:
+        msg: "No network connectivity. Please check your network settings."
+      when: ping_result.rc != 0
+
+    - name: Ensure dpkg is in a consistent state
+      command: sudo dpkg --configure -a
+      ignore_errors: yes
+
+    - name: Wait for dpkg lock to be released
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          sleep 1
+        done
+
+    - name: Move dpkg lock file
+      command: sudo mv /var/lib/dpkg/lock /var/lib/dpkg/lock.bak
+      ignore_errors: yes
+
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        force_apt_get: yes
+        allow_unauthenticated: yes
+      register: apt_upgrade_result
+      retries: 5
+      delay: 60
+      until: apt_upgrade_result is success
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Add PostgreSQL APT repository
+      apt_key:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Add PostgreSQL repository
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+        state: present
+
+    - name: Update apt cache after adding PostgreSQL repository
+      apt:
+        update_cache: yes
+
+    - name: Install PostgreSQL 16
+      apt:
+        name: postgresql-16
+        state: present
+
+    - name: Ensure PostgreSQL service is enabled and started
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Set password for the default PostgreSQL user
+      command: sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '{{ postgres_password }}';"
+
+    - name: Check if veeam user exists
+      command: sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='veeam'"
+      register: veeam_user_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create veeam user with password
+      command: sudo -u postgres psql -c "CREATE USER veeam WITH PASSWORD '{{ veeam_password }}';"
+      when: veeam_user_exists.stdout == ''
+
+    - name: Grant superuser privileges to veeam user
+      command: sudo -u postgres psql -c "ALTER USER veeam WITH SUPERUSER;"
+
+    - name: Create database for veeam user
+      command: sudo -u postgres psql -c "CREATE DATABASE veeam OWNER veeam;"
+      ignore_errors: yes
+
+    - name: Verify PostgreSQL installation
+      command: psql --version
+      register: psql_version
+      changed_when: false
+
+    - name: Display PostgreSQL version
+      debug:
+        msg: "PostgreSQL version: {{ psql_version.stdout }}"
+
+    - name: Allow remote connections in postgresql.conf
+      lineinfile:
+        path: /etc/postgresql/16/main/postgresql.conf
+        regexp: '^#listen_addresses ='
+        line: "listen_addresses = '*'"
+      notify: restart postgresql
+
+    - name: Allow remote connections in pg_hba.conf
+      lineinfile:
+        path: /etc/postgresql/16/main/pg_hba.conf
+        line: "host all all 0.0.0.0/0 md5"
+      notify: restart postgresql
+
+    - name: Open PostgreSQL port in firewall
+      ufw:
+        rule: allow
+        port: 5432
+        proto: tcp
+
+  handlers:
+    - name: restart postgresql
+      service:
+        name: postgresql
+        state: restarted
